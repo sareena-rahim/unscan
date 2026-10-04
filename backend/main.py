@@ -38,6 +38,10 @@ app.add_middleware(
 jobs: dict[str, dict] = {}
 job_runner = ThreadPoolExecutor(max_workers=MAX_PARALLEL_JOBS)
 
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
 
 def ocr_page(img: Image.Image) -> bytes:
     """OCR one page image -> single-page PDF (image + invisible text layer)."""
