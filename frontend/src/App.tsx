@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState, DragEvent, ChangeEvent } from "react";
 
-const rawApi = import.meta.env.VITE_API_URL || "https://unscan-1.onrender.com";
+const rawApi = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const API = (/^https?:\/\//.test(rawApi) ? rawApi : `https://${rawApi}`).replace(/\/+$/, "");
-const POLL_MS = 1000;
 
 type Status = "idle" | "uploading" | "queued" | "processing" | "done" | "error";
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+type JobUpdate = { status: string; page: number; total: number; error: string | null };
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
@@ -17,14 +16,16 @@ export default function App() {
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [downloadName, setDownloadName] = useState("");
   const cancelled = useRef(false);
+  const events = useRef<EventSource | null>(null);
 
   const busy = status === "uploading" || status === "queued" || status === "processing";
   const percent = progress.total ? Math.round((progress.page / progress.total) * 100) : 0;
 
-  // Stop polling if the page is closed or the component unmounts
+  // Close the progress stream if the component unmounts
   useEffect(() => {
     return () => {
       cancelled.current = true;
+      events.current?.close();
     };
   }, []);
 
@@ -38,8 +39,39 @@ export default function App() {
   }
 
   async function readError(res: Response, fallback: string) {
-    const data = await res.json().catch(() => ({}));
-    return data.detail ?? fallback;
+    const data = await res.json().catch(() => null);
+    let host = "";
+    try {
+      host = new URL(res.url).host;
+    } catch {}
+    return data?.detail ?? `${fallback} (HTTP ${res.status} from ${host})`;
+  }
+
+  // One open connection; the server pushes an update only when progress changes
+  function waitForJob(jobId: string, onUpdate: (job: JobUpdate) => void) {
+    return new Promise<void>((resolve, reject) => {
+      const es = new EventSource(`${API}/api/jobs/${jobId}/events`);
+      events.current = es;
+
+      es.onmessage = (ev) => {
+        const job: JobUpdate = JSON.parse(ev.data);
+        onUpdate(job);
+        if (job.status === "done") {
+          es.close();
+          resolve();
+        } else if (job.status === "error") {
+          es.close();
+          reject(new Error(job.error ?? "Conversion failed"));
+        }
+      };
+
+      es.onerror = () => {
+        // CONNECTING means the browser is retrying by itself; CLOSED means it gave up
+        if (es.readyState === EventSource.CLOSED) {
+          reject(new Error("Lost track of the conversion. The server may have restarted."));
+        }
+      };
+    });
   }
 
   async function convert() {
@@ -61,19 +93,12 @@ export default function App() {
       setProgress({ page: 0, total });
       setStatus("queued");
 
-      // 2. Poll for progress until done
-      while (!cancelled.current) {
-        await sleep(POLL_MS);
-        const res = await fetch(`${API}/api/jobs/${job_id}`);
-        if (!res.ok) throw new Error(await readError(res, "Lost track of the conversion"));
-        const job = await res.json();
+      // 2. Follow progress until done
+      await waitForJob(job_id, (job) => {
         setProgress({ page: job.page, total: job.total });
-
-        if (job.status === "error") throw new Error(job.error ?? "Conversion failed");
         if (job.status === "queued") setStatus("queued");
         if (job.status === "processing") setStatus("processing");
-        if (job.status === "done") break;
-      }
+      });
       if (cancelled.current) return;
 
       // 3. Download the finished PDF
@@ -87,7 +112,14 @@ export default function App() {
       triggerDownload(url, name);
       setStatus("done");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong");
+      events.current?.close();
+      setError(
+        e instanceof TypeError
+          ? "Can't reach the server. It may be waking up, so wait a minute and try again."
+          : e instanceof Error
+          ? e.message
+          : "Something went wrong"
+      );
       setStatus("error");
     }
   }

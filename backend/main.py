@@ -1,4 +1,6 @@
+import asyncio
 import io
+import json
 import os
 import time
 import uuid
@@ -7,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytesseract
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pdf2image import convert_from_bytes, pdfinfo_from_bytes
 from pdf2image.exceptions import PDFInfoNotInstalledError
 from PIL import Image
@@ -18,12 +20,13 @@ MAX_MB = int(os.getenv("MAX_MB", "50"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "60"))
 MAX_PARALLEL_JOBS = int(os.getenv("MAX_PARALLEL_JOBS", "1"))  # extra jobs wait in the queue
 JOB_TTL = 30 * 60  # seconds a finished job is kept before cleanup
-DPI = 200
-CHUNK = 4  # pages rasterized and OCR'd at a time, keeps memory low
-ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173"
-).split(",")
+DPI = int(os.getenv("DPI", "200"))
+CHUNK = int(os.getenv("CHUNK", "4"))  # pages rasterized and OCR'd at a time, keeps memory low
+ORIGINS = [
+    o.strip().rstrip("/")
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    if o.strip()
+]
 
 app = FastAPI(title="Unscan API")
 app.add_middleware(
@@ -37,6 +40,7 @@ app.add_middleware(
 # In-memory job store. Fine for a single server process (run uvicorn with 1 worker).
 jobs: dict[str, dict] = {}
 job_runner = ThreadPoolExecutor(max_workers=MAX_PARALLEL_JOBS)
+
 
 @app.get("/")
 def health():
@@ -145,4 +149,37 @@ def job_result(job_id: str):
         job["result"],
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{job["name"]}"'},
+    )
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def job_events(job_id: str):
+    """Server-Sent Events: pushes progress only when it changes (one open request)."""
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found. It may have expired or the server restarted.")
+
+    async def stream():
+        last = None
+        quiet = 0
+        while True:
+            job = jobs.get(job_id)
+            if not job:
+                return
+            snap = {k: job[k] for k in ("status", "page", "total", "error")}
+            if snap != last:
+                yield f"data: {json.dumps(snap)}\n\n"
+                last, quiet = snap, 0
+            else:
+                quiet += 1
+                if quiet >= 15:  # comment line keeps proxies from closing an idle connection
+                    yield ": keepalive\n\n"
+                    quiet = 0
+            if snap["status"] in ("done", "error"):
+                return
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
