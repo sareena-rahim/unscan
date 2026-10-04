@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, DragEvent, ChangeEvent } from "react";
 
 const API =
-  import.meta.env.VITE_API_URL ?? "https://unscan-1.onrender.com";
+  import.meta.env.API_URL ?? "https://unscan-1.onrender.com";
 const POLL_MS = 1000;
 
 type Status = "idle" | "uploading" | "queued" | "processing" | "done" | "error";
