@@ -3,7 +3,9 @@ import { useEffect, useRef, useState, DragEvent, ChangeEvent } from "react";
 const rawApi = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const API = (/^https?:\/\//.test(rawApi) ? rawApi : `https://${rawApi}`).replace(/\/+$/, "");
 
-type Status = "idle" | "uploading" | "queued" | "processing" | "done" | "error";
+type Status = "idle" | "uploading" | "starting" | "queued" | "processing" | "done" | "error";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type JobUpdate = { status: string; page: number; total: number; error: string | null };
 
@@ -18,7 +20,7 @@ export default function App() {
   const cancelled = useRef(false);
   const events = useRef<EventSource | null>(null);
 
-  const busy = status === "uploading" || status === "queued" || status === "processing";
+  const busy = status === "uploading" || status === "starting" || status === "queued" || status === "processing";
   const percent = progress.total ? Math.round((progress.page / progress.total) * 100) : 0;
 
   // Close the progress stream if the component unmounts
@@ -47,30 +49,55 @@ export default function App() {
     return data?.detail ?? `${fallback} (HTTP ${res.status} from ${host})`;
   }
 
-  // One open connection; the server pushes an update only when progress changes
+  // Follows a job. Uses one open connection (SSE) when the network allows it and
+  // falls back to slow polling if no update arrives or the stream breaks.
   function waitForJob(jobId: string, onUpdate: (job: JobUpdate) => void) {
     return new Promise<void>((resolve, reject) => {
+      let finished = false;
+      let polling = false;
+      let gotMessage = false;
       const es = new EventSource(`${API}/api/jobs/${jobId}/events`);
       events.current = es;
 
-      es.onmessage = (ev) => {
-        const job: JobUpdate = JSON.parse(ev.data);
+      const finish = (err?: Error) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(watchdog);
+        es.close();
+        if (err) reject(err);
+        else resolve();
+      };
+
+      const handle = (job: JobUpdate) => {
+        gotMessage = true;
         onUpdate(job);
-        if (job.status === "done") {
-          es.close();
-          resolve();
-        } else if (job.status === "error") {
-          es.close();
-          reject(new Error(job.error ?? "Conversion failed"));
+        if (job.status === "done") finish();
+        else if (job.status === "error") finish(new Error(job.error ?? "Conversion failed"));
+      };
+
+      const startPolling = async () => {
+        if (polling || finished) return;
+        polling = true;
+        es.close();
+        while (!finished && !cancelled.current) {
+          try {
+            const res = await fetch(`${API}/api/jobs/${jobId}`);
+            if (!res.ok) return finish(new Error(await readError(res, "Lost track of the conversion")));
+            handle(await res.json());
+          } catch {
+            // temporary network problem: keep trying
+          }
+          await sleep(2500);
         }
       };
 
-      es.onerror = () => {
-        // CONNECTING means the browser is retrying by itself; CLOSED means it gave up
-        if (es.readyState === EventSource.CLOSED) {
-          reject(new Error("Lost track of the conversion. The server may have restarted."));
-        }
-      };
+      es.onmessage = (ev) => handle(JSON.parse(ev.data));
+      es.onerror = () => startPolling(); // stream blocked or dropped: switch to polling
+
+      // Some proxies hold streamed data back. If nothing arrives quickly, poll instead.
+      const watchdog = setTimeout(() => {
+        if (!gotMessage) startPolling();
+      }, 6000);
     });
   }
 
@@ -91,7 +118,7 @@ export default function App() {
       if (!start.ok) throw new Error(await readError(start, "Could not start conversion"));
       const { job_id, total } = await start.json();
       setProgress({ page: 0, total });
-      setStatus("queued");
+      setStatus("starting"); // the server tells us if we are queued or processing
 
       // 2. Follow progress until done
       await waitForJob(job_id, (job) => {
@@ -167,6 +194,8 @@ export default function App() {
   const buttonLabel =
     status === "uploading"
       ? "Uploading..."
+      : status === "starting"
+      ? "Starting..."
       : status === "queued"
       ? "Waiting in queue..."
       : status === "processing"

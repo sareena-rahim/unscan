@@ -20,6 +20,7 @@ MAX_MB = int(os.getenv("MAX_MB", "50"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "60"))
 MAX_PARALLEL_JOBS = int(os.getenv("MAX_PARALLEL_JOBS", "1"))  # extra jobs wait in the queue
 JOB_TTL = 30 * 60  # seconds a finished job is kept before cleanup
+PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "180"))  # seconds before one stuck page is abandoned
 DPI = int(os.getenv("DPI", "200"))
 CHUNK = int(os.getenv("CHUNK", "4"))  # pages rasterized and OCR'd at a time, keeps memory low
 ORIGINS = [
@@ -54,7 +55,7 @@ def ocr_page(img: Image.Image) -> bytes:
     buf.seek(0)
     jpeg = Image.open(buf)  # format stays JPEG, so tesseract embeds the JPEG
     return pytesseract.image_to_pdf_or_hocr(
-        jpeg, extension="pdf", lang="eng", config="--psm 4"
+        jpeg, extension="pdf", lang="eng", config="--psm 4", timeout=PAGE_TIMEOUT
     )
 
 
@@ -69,6 +70,8 @@ def friendly_error(e: Exception) -> str:
 def run_job(job_id: str, data: bytes) -> None:
     job = jobs[job_id]
     job["status"] = "processing"
+    tag = f"[job {job_id[:8]}]"
+    print(f"{tag} started, {job['total']} pages", flush=True)
     try:
         writer = PdfWriter()
         total = job["total"]
@@ -79,14 +82,17 @@ def run_job(job_id: str, data: bytes) -> None:
                 for page_pdf in pool.map(ocr_page, images):
                     writer.add_page(PdfReader(io.BytesIO(page_pdf)).pages[0])
                     job["page"] += 1
+                    print(f"{tag} page {job['page']}/{total}", flush=True)
                 del images
         out = io.BytesIO()
         writer.write(out)
         job["result"] = out.getvalue()
         job["status"] = "done"
+        print(f"{tag} done", flush=True)
     except Exception as e:  # report any failure to the client instead of hanging
         job["status"] = "error"
         job["error"] = friendly_error(e)
+        print(f"{tag} failed: {e!r}", flush=True)
     finally:
         job["finished_at"] = time.time()
 
