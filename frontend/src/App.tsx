@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, DragEvent, ChangeEvent } from "react";
 
-const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL;
 const POLL_MS = 1000;
 
 type Status = "idle" | "uploading" | "queued" | "processing" | "done" | "error";

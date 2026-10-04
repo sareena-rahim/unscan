@@ -20,7 +20,7 @@ MAX_PARALLEL_JOBS = int(os.getenv("MAX_PARALLEL_JOBS", "1"))  # extra jobs wait 
 JOB_TTL = 30 * 60  # seconds a finished job is kept before cleanup
 DPI = 200
 CHUNK = 4  # pages rasterized and OCR'd at a time, keeps memory low
-ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+ORIGINS=https://frontend-six-swart-14.vercel.app
 
 app = FastAPI(title="Unscan API")
 app.add_middleware(
