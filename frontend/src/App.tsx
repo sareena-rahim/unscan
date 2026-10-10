@@ -5,6 +5,13 @@ const API = (/^https?:\/\//.test(rawApi) ? rawApi : `https://${rawApi}`).replace
 
 type Status = "idle" | "uploading" | "starting" | "queued" | "processing" | "done" | "error";
 
+const CANCELLED = "__cancelled__";
+
+const formatTime = (sec: number) => {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type JobUpdate = { status: string; page: number; total: number; error: string | null };
@@ -19,9 +26,21 @@ export default function App() {
   const [downloadName, setDownloadName] = useState("");
   const cancelled = useRef(false);
   const events = useRef<EventSource | null>(null);
+  const jobId = useRef<string | null>(null);
+  const stopWaiting = useRef<(() => void) | null>(null);
+  const startedAt = useRef(0); // when the upload began
+  const processingSince = useRef(0); // when the server started scanning pages
+  const [elapsed, setElapsed] = useState(0);
 
   const busy = status === "uploading" || status === "starting" || status === "queued" || status === "processing";
   const percent = progress.total ? Math.round((progress.page / progress.total) * 100) : 0;
+
+  // Tick once a second while a conversion is running (drives the timer and the estimate)
+  useEffect(() => {
+    if (!busy) return;
+    const id = setInterval(() => setElapsed((Date.now() - startedAt.current) / 1000), 1000);
+    return () => clearInterval(id);
+  }, [busy]);
 
   // Close the progress stream if the component unmounts
   useEffect(() => {
@@ -68,11 +87,14 @@ export default function App() {
         else resolve();
       };
 
+      stopWaiting.current = () => finish(new Error(CANCELLED));
+
       const handle = (job: JobUpdate) => {
         gotMessage = true;
         onUpdate(job);
         if (job.status === "done") finish();
         else if (job.status === "error") finish(new Error(job.error ?? "Conversion failed"));
+        else if (job.status === "cancelled") finish(new Error(CANCELLED));
       };
 
       const startPolling = async () => {
@@ -108,6 +130,10 @@ export default function App() {
     setDownloadUrl(null);
     setError("");
     setProgress({ page: 0, total: 0 });
+    startedAt.current = Date.now();
+    processingSince.current = 0;
+    jobId.current = null;
+    setElapsed(0);
     setStatus("uploading");
 
     try {
@@ -117,6 +143,7 @@ export default function App() {
       const start = await fetch(`${API}/api/jobs`, { method: "POST", body });
       if (!start.ok) throw new Error(await readError(start, "Could not start conversion"));
       const { job_id, total } = await start.json();
+      jobId.current = job_id;
       setProgress({ page: 0, total });
       setStatus("starting"); // the server tells us if we are queued or processing
 
@@ -124,7 +151,10 @@ export default function App() {
       await waitForJob(job_id, (job) => {
         setProgress({ page: job.page, total: job.total });
         if (job.status === "queued") setStatus("queued");
-        if (job.status === "processing") setStatus("processing");
+        if (job.status === "processing") {
+          if (!processingSince.current) processingSince.current = Date.now();
+          setStatus("processing");
+        }
       });
       if (cancelled.current) return;
 
@@ -140,6 +170,11 @@ export default function App() {
       setStatus("done");
     } catch (e) {
       events.current?.close();
+      if (e instanceof Error && e.message === CANCELLED) {
+        setStatus("idle");
+        setProgress({ page: 0, total: 0 });
+        return;
+      }
       setError(
         e instanceof TypeError
           ? "Can't reach the server. It may be waking up, so wait a minute and try again."
@@ -149,6 +184,12 @@ export default function App() {
       );
       setStatus("error");
     }
+  }
+
+  function cancel() {
+    const id = jobId.current;
+    stopWaiting.current?.(); // stop following progress; convert() resets the page
+    if (id) fetch(`${API}/api/jobs/${id}/cancel`, { method: "POST" }).catch(() => {});
   }
 
   const handleDragOver = (e: DragEvent) => {
@@ -190,6 +231,12 @@ export default function App() {
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
+
+  const scanSeconds = processingSince.current ? (Date.now() - processingSince.current) / 1000 : 0;
+  const etaSeconds =
+    progress.page > 0 && progress.total > progress.page
+      ? (scanSeconds / progress.page) * (progress.total - progress.page)
+      : null;
 
   const buttonLabel =
     status === "uploading"
@@ -339,7 +386,14 @@ export default function App() {
                 }}
               />
             </div>
-            <p style={styles.progressHint}>Large files can take a few minutes. Keep this tab open.</p>
+            <p style={styles.progressHint}>
+              Elapsed {formatTime(elapsed)}
+              {status === "processing" && etaSeconds !== null && ` · about ${formatTime(etaSeconds)} left`}
+              {" · "}Keep this tab open.
+            </p>
+            <button type="button" onClick={cancel} style={styles.cancelBtn}>
+              Cancel
+            </button>
           </div>
         )}
 
@@ -603,6 +657,16 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     fontSize: "13px",
     textDecoration: "underline",
+    cursor: "pointer",
+  },
+  cancelBtn: {
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    marginTop: "10px",
+    color: "#dc2626",
+    fontWeight: 600,
+    fontSize: "12px",
     cursor: "pointer",
   },
   errorBox: {
